@@ -21,3 +21,6 @@ neo4j_import/
 
 # uv lock file
 uv.lock
+
+# Claude Code guidance
+CLAUDE.md
