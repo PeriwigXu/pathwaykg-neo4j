@@ -11,8 +11,21 @@ dependencies = [
     "regex>=2026.2.28",
     "tenacity>=9.1.4",
     "tqdm>=4.67.3",
+    "neo4j>=5.22.0",
+    "python-dotenv>=1.0.0",
+    "click>=8.1.0",
 ]
 
 [project.scripts]
 kgbuild = "pathwaykg.build:main"
 visualize = "pathwaykg.visualize:main"
+kgimport = "pathwaykg.neo4j_adapter:main"
+kgbatch = "pathwaykg.batch:main"
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pathwaykg*"]
+exclude = ["assets*", "examples*", "neo4j_data*", "neo4j_logs*", "neo4j_import*"]

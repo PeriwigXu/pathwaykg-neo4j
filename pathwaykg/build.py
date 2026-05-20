@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
 
-"""Build RDF knowledge graphs from KEGG data"""
+"""Build RDF knowledge graphs from KEGG data using Click CLI"""
 
+import os
 import sys
-import argparse
+import tempfile
+from pathlib import Path
+from dotenv import load_dotenv
+import click
 from tqdm import tqdm
-from Bio.KEGG import Gene, Compound
+from Bio.KEGG import Compound
 from rdflib.plugins.sparql import prepareQuery
 from rdflib import Namespace, Graph, Literal, URIRef
-import pathwaykg.namespaces as ns
-from pathwaykg.fetch import fetch_pathway_kgml, parse_kgml, KGMLData, fetch_gene_records, fetch_reaction_records, fetch_compound_records
 import regex
+
+import pathwaykg.namespaces as ns
+from pathwaykg.fetch import fetch_pathway_kgml, parse_kgml, KGMLData, fetch_reaction_records, fetch_compound_records
+from pathwaykg.neo4j_adapter import Neo4jAdapter, Neo4jConfig
 
 
 class InvalidKEGGPathwayEntry(Exception):
     def __init__(self, s: str):
-        super().__init__(f"Invalid KEGG pathway entry \"{s}\". A valid KEGG pathway entry consists of \"ko\" or a three-letter organism code, followed by five digits")
+        super().__init__(f'Invalid KEGG pathway entry "{s}". A valid KEGG pathway entry consists of "ko" or a three-letter organism code, followed by five digits')
 
 
 def add_reaction(graph: Graph, reaction_record: dict) -> None:
+    """Add reaction with enzyme (EC) as core entity"""
     reaction_uri = ns.KEGG[reaction_record["id"]]
     graph.add((reaction_uri, ns.RDF.type, ns.KG["Reaction"]))
     graph.add((reaction_uri, ns.RDFS.label, Literal(reaction_record["definition"])))
-    
+
     for id in reaction_record["substrates"]:
         compound_uri = ns.KEGG[id]
         graph.add((reaction_uri, ns.KG["hasSubstrate"], compound_uri))
@@ -31,73 +38,33 @@ def add_reaction(graph: Graph, reaction_record: dict) -> None:
         compound_uri = ns.KEGG[id]
         graph.add((reaction_uri, ns.KG["hasProduct"], compound_uri))
 
+    # Add Enzyme nodes via EC numbers
     for ec in reaction_record.get("enzymes", []):
-        graph.add((reaction_uri, ns.KG["hasEC"], ns.EC[ec]))
-
-    return None
+        ec_uri = ns.EC[ec]
+        graph.add((ec_uri, ns.RDF.type, ns.KG["Enzyme"]))
+        graph.add((ec_uri, ns.RDFS.label, Literal(ec)))
+        graph.add((reaction_uri, ns.KG["catalyzedBy"], ec_uri))
 
 
 def add_compound(graph: Graph, compound_record: Compound.Record) -> None:
     compound_uri = ns.KEGG[compound_record.entry]
-
     graph.add((compound_uri, ns.RDF.type, ns.KG["Compound"]))
-    graph.add((compound_uri, ns.RDFS.label, Literal(compound_record.name[0])))
-
-    return None
-
-
-def extract_ec(description: str) -> list[str]:
-    return [ec for block in regex.findall(r"\[EC:([\d\.\- ]+)\]", description) for ec in block.split()]
-
-
-def extract_dblinks(record: Gene.Record) -> dict[str, list]:
-    return {key: value for key, value in record.dblinks}
-
-
-def add_enzyme(
-    graph: Graph, record: Gene.Record, organism_namespace: Namespace
-) -> None:
-    gene_uri = organism_namespace[record.entry.split(":")[-1]]
-    gene_dblinks = extract_dblinks(record)
-
-    graph.add((gene_uri, ns.RDF.type, ns.KG["Gene"]))
-    for name in record.name:
-        graph.add((gene_uri, ns.RDFS.label, Literal(name)))
-    graph.add((gene_uri, ns.KG["keggID"], URIRef(f"https://www.kegg.jp/entry/{record.entry}")))
-    for accession in gene_dblinks.get("UniProt", []):
-        graph.add((gene_uri, ns.OWL.sameAs, ns.UNIPROT[accession]))
-
-    for ko, description in record.orthology:
-        graph.add((gene_uri, ns.KG["hasOrtholog"], ns.KEGG[ko]))
-
-        for ec in extract_ec(description):
-            graph.add((ns.KEGG[ko], ns.KG["hasEC"], ns.EC[ec]))
-            graph.add((gene_uri, ns.KG["hasEC"], ns.EC[ec]))
-
-        graph.add((ns.KEGG[ko], ns.RDF.type, ns.KG["KOTerm"]))
-        graph.add((ns.KEGG[ko], ns.RDFS.label, Literal(description)))
-
-    return None
+    # name is metadata - leave it out, Neo4j will use entity_id for display
 
 
 def build_kg(organism_id: str, kgml_data: KGMLData) -> Graph:
-    organism_namespace = ns.create_organism_namespace(organism_id)
+    """Build knowledge graph with only what's in the pathway map: Enzyme, Reaction, Compound"""
     graph = Graph()
-    graph.bind(organism_id, organism_namespace)
     graph.bind("kg", ns.KG)
     graph.bind("kegg", ns.KEGG)
     graph.bind("ec", ns.EC)
 
-    gene_records = fetch_gene_records(kgml_data.gene_ids)
-    prog_desc = "Fetching gene data"
-    for record in tqdm(gene_records, total=len(kgml_data.gene_ids), desc= prog_desc, file=sys.stderr):
-        add_enzyme(graph, record, organism_namespace)
-
+    # Fetch reaction records (includes EC numbers for enzymes)
     reaction_records = fetch_reaction_records(kgml_data.reaction_ids)
-    prog_desc = "Fetching reaction data"
-    for record in tqdm(reaction_records, total=len(kgml_data.reaction_ids), desc=prog_desc, file=sys.stderr):
+    for record in tqdm(reaction_records, total=len(kgml_data.reaction_ids), desc="Fetching reaction data", file=sys.stderr):
         add_reaction(graph, record)
 
+    # Get all compounds involved in reactions
     q = prepareQuery("""
 SELECT DISTINCT ?compound WHERE {
     { ?reaction kg:hasSubstrate ?compound }
@@ -109,59 +76,140 @@ SELECT DISTINCT ?compound WHERE {
     compound_ids = {str(row.compound).split("/")[-1] for row in graph.query(q)}
 
     compound_records = fetch_compound_records(compound_ids)
-    prog_desc = "Fetching compound data"
-    for record in tqdm(compound_records, total=len(compound_ids), desc=prog_desc, file=sys.stderr):
+    for record in tqdm(compound_records, total=len(compound_ids), desc="Fetching compound data", file=sys.stderr):
         add_compound(graph, record)
-
-    for gene_id, reactions in kgml_data.gene_reactions.items():
-        gene_uri = organism_namespace[gene_id.split(':')[-1]]
-        for reaction in reactions:
-            reaction_uri = ns.KEGG[reaction]
-            graph.add((gene_uri, ns.KG["catalyzes"], reaction_uri))
 
     return graph
 
 
-def main() -> int:
-    arg_parser = argparse.ArgumentParser("BuildKG", description="Build an RDF knowledge graph for a pathway")
-    arg_parser.add_argument("--pathway", "-p", type=str, help="KEGG pathway entry", required=True)
-
-    args = arg_parser.parse_args()
-
-    if len(args.pathway) == 7:
-        organism, pathway = args.pathway[:2], args.pathway[2:]
-        
+def validate_pathway(pathway: str) -> tuple[str, str]:
+    if len(pathway) == 7:
+        organism, path_id = pathway[:2], pathway[2:]
         if organism == "ko":
-            print("map/ko pathways are not supported", file=sys.stderr)
-
-            return 1
-        
-        else:
-            raise InvalidKEGGPathwayEntry(args.pathway)
-
-    elif len(args.pathway) == 8:
-        organism, pathway = args.pathway[:3], args.pathway[3:]
-
+            raise InvalidKEGGPathwayEntry(pathway)
+    elif len(pathway) == 8:
+        organism, path_id = pathway[:3], pathway[3:]
         if organism == "map":
-            print("map/ko pathways are not supported", file=sys.stderr)
-
-            return 1
-            
-
+            raise InvalidKEGGPathwayEntry(pathway)
     else:
-        raise InvalidKEGGPathwayEntry(args.pathway)
-    
+        raise InvalidKEGGPathwayEntry(pathway)
 
-    if not all(c.isalpha() for c in organism) or not all(c.isnumeric() for c in pathway):
-        raise InvalidKEGGPathwayEntry(args.pathway)
+    if not all(c.isalpha() for c in organism) or not all(c.isnumeric() for c in path_id):
+        raise InvalidKEGGPathwayEntry(pathway)
 
-    kgml_data = parse_kgml(fetch_pathway_kgml(organism, pathway))
+    return organism, path_id
 
-    g = build_kg(organism, kgml_data)
 
-    g.serialize(sys.stdout.buffer, "turtle")
+@click.group()
+def cli():
+    """Build RDF knowledge graphs from KEGG data"""
+    pass
 
-    return 0
+
+@cli.command()
+@click.option("--pathway", "-p", required=True, help="KEGG pathway entry (e.g., hsa00010)")
+def ttl(pathway):
+    """Export to Turtle format"""
+    try:
+        organism, path_id = validate_pathway(pathway)
+    except InvalidKEGGPathwayEntry as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+
+    kgml_data = parse_kgml(fetch_pathway_kgml(organism, path_id))
+    graph = build_kg(organism, kgml_data)
+
+    graph.serialize(sys.stdout.buffer, format="turtle", encoding='utf-8')
+
+
+@cli.group()
+def neo4j():
+    """Build and import to Neo4j"""
+    pass
+
+
+@neo4j.command("config")
+@click.option("--show", is_flag=True, help="Show current Neo4j configuration from .env")
+@click.option("--validate", is_flag=True, help="Validate Neo4j connection using .env config")
+def neo4j_config(show, validate):
+    """Manage Neo4j configuration from .env file"""
+    load_dotenv()
+
+    uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+    user = os.getenv("NEO4J_USER", "neo4j")
+    password = os.getenv("NEO4J_PASSWORD", "password")
+    database = os.getenv("NEO4J_DATABASE", "neo4j")
+
+    if show:
+        click.echo(f"NEO4J_URI={uri}")
+        click.echo(f"NEO4J_USER={user}")
+        click.echo("NEO4J_PASSWORD=***")
+        click.echo(f"NEO4J_DATABASE={database}")
+        return
+
+    if validate:
+        config = Neo4jConfig(uri=uri, user=user, password=password, database=database)
+        adapter = Neo4jAdapter(config)
+        try:
+            adapter.connect()
+            click.echo("[OK] Neo4j connection successful")
+            adapter.close()
+        except Exception as e:
+            click.echo(f"[FAIL] Neo4j connection failed: {e}", err=True)
+            raise SystemExit(1)
+        return
+
+    click.echo("Use --show or --validate")
+
+
+@neo4j.command("import")
+@click.option("--pathway", "-p", required=True, help="KEGG pathway entry (e.g., hsa00010)")
+@click.option("--uri", help="Neo4j URI (overrides .env)")
+@click.option("--user", help="Neo4j user (overrides .env)")
+@click.option("--password", help="Neo4j password (overrides .env)")
+@click.option("--database", help="Neo4j database (overrides .env)")
+@click.option("--clear", is_flag=True, help="Clear database before import")
+def neo4j_import(pathway, uri, user, password, database, clear):
+    """Build and import pathway to Neo4j"""
+    load_dotenv()
+
+    try:
+        organism, path_id = validate_pathway(pathway)
+    except InvalidKEGGPathwayEntry as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+
+    kgml_data = parse_kgml(fetch_pathway_kgml(organism, path_id))
+    graph = build_kg(organism, kgml_data)
+
+    config = Neo4jConfig(
+        uri=uri or os.getenv("NEO4J_URI", "bolt://localhost:7687"),
+        user=user or os.getenv("NEO4J_USER", "neo4j"),
+        password=password or os.getenv("NEO4J_PASSWORD", "password"),
+        database=database or os.getenv("NEO4J_DATABASE", "neo4j")
+    )
+
+    adapter = Neo4jAdapter(config)
+    adapter.connect()
+
+    if clear:
+        click.echo("Clearing database...")
+        adapter.clear_database()
+
+    click.echo("Creating indexes...")
+    adapter.create_indexes()
+
+    ttl_path = Path(tempfile.gettempdir()) / f"{pathway}.ttl"
+    graph.serialize(ttl_path, format="turtle", encoding='utf-8')
+
+    nodes, rels = adapter.import_from_ttl(ttl_path, pathway)
+    click.echo(f"Created {nodes} nodes, {rels} relationships")
+    adapter.close()
+
+
+def main():
+    cli()
+
 
 if __name__ == "__main__":
     main()

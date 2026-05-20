@@ -4,8 +4,20 @@ __pycache__/
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
 .notes/
 
 # Virtual environments
-.venv
+.venv/
+
+# Environment variables (contains secrets)
+.env
+.env.local
+
+# Neo4j data and logs
+neo4j_data/
+neo4j_logs/
+neo4j_import/
+
+# uv lock file
+uv.lock
