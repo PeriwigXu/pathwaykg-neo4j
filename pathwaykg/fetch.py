@@ -14,7 +14,7 @@ from tenacity import (
 )
 from typing import Generator, Any, TextIO, Iterable
 import itertools
-from Bio.KEGG import Gene, REST, Compound
+from Bio.KEGG import REST, Compound
 
 KEGG_REST_GET_BATCH_LIMIT = 10
 
@@ -124,46 +124,8 @@ def fetch_compound_records(compound_ids: set[str]) -> Generator[Compound.Record,
         yield from Compound.parse(io.StringIO(_fetch_batch_text(list(batch_ids))))
 
 
-
-@retry(
-    wait=wait_exponential(**WAIT_EXPONENTIAL_ARGS),
-    stop=stop_after_attempt(5),
-    retry=retry_if_exception_type(urllib.error.URLError),
-)
-def fetch_pathway_genes(organism_id: str, pathway_id: str) -> str:
-    response = REST.kegg_link(organism_id, f"path:{organism_id}{pathway_id}")
-
-    return response.read()
-
-
-def extract_gene_ids(text: str) -> list[str]:
-    return sorted(set(row.split()[-1].strip() for row in text.splitlines()))
-
-
-def fetch_gene_records(gene_ids: list[str]) -> Generator[Gene.Record, Any, None]:
-    for batch_ids in itertools.batched(gene_ids, KEGG_REST_GET_BATCH_LIMIT):
-        yield from Gene.parse(io.StringIO(_fetch_batch_text(list(batch_ids))))
-
-
 def main():
-    organism_id = input("Give an organism ID:\t")
-    pathway_id = input("Give a pathway ID:\t")
-
-    xml_handle = fetch_pathway_kgml(organism_id, pathway_id)
-    data = parse_kgml(xml_handle)
-    reaction_records = fetch_generic_records(data.reaction_ids)
-
-    for record in reaction_records:
-        reaction_data = parse_reaction_record(record)
-
-        for compound_record in fetch_compound_records(reaction_data["substrates"]):
-            print(compound_record.entry)
-            print(compound_record.name)
-            break
-        break
-
-    # sys.stdout.write('\n'.join(reaction_records[:10]))
-
+    """Test function - not used in normal workflow"""
     return 0
 
 
