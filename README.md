@@ -7,8 +7,8 @@ Build and query Neo4j knowledge graphs from the KEGG database. Each entity and r
 ## Installation
 
 ```bash
-git clone https://github.com/PeriwigXu/pathwaykg
-cd pathwaykg
+git clone https://github.com/PeriririIan/pathwaykg-neo4j
+cd pathwaykg-neo4j
 uv sync
 ```
 
