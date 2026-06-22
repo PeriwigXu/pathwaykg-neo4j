@@ -24,6 +24,7 @@ uv.lock
 
 # Claude Code guidance
 CLAUDE.md
+claude.md
 
 # Examples and assets (no longer used)
 examples/

@@ -22,6 +22,6 @@ kgbatch = "pathwaykg.batch:main"
 package = true
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["src"]
 include = ["pathwaykg*"]
 exclude = ["neo4j_data*", "neo4j_logs*", "neo4j_import*"]
